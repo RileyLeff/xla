@@ -13,6 +13,9 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+#include <sanitizer/msan_interface.h>
+#endif
 #include <string>
 #include <utility>
 #include <vector>
@@ -97,6 +100,10 @@ ENTRY e {
       /*entry_point_name=*/"entry",
       /*relocation_model=*/CpuAotCompilationOptions::RelocationModel::BigPic);
   aot_options->set_executor(stream_exec);
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+  aot_options->set_sanitize_memory(true);
+  aot_options->set_sanitize_memory_track_origins(__msan_get_track_origins());
+#endif
 
   auto test = [this, &compiler, aot_options = std::move(aot_options)](
                   absl::string_view test_name, absl::string_view hlo, int input,
@@ -110,6 +117,9 @@ ENTRY e {
 
     ASSERT_OK_AND_ASSIGN(std::string serialized_aot_result,
                          aot_results[0]->SerializeAsString());
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+    EXPECT_TRUE(absl::StrContains(serialized_aot_result, "__msan_"));
+#endif
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<CompiledModule> aot_result,
         compiler->LoadAotCompilationResult(serialized_aot_result));
