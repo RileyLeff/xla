@@ -18,12 +18,15 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
+#include "absl/base/config.h"  // IWYU pragma: keep
+#include "absl/log/log.h"      // IWYU pragma: keep
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/CoreContainers.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"  // IWYU pragma: keep (msan)
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/ExecutionEngine/Orc/Shared/JITDylibLookupFlags.h"
@@ -61,22 +64,63 @@ static std::optional<llvm::orc::ExecutorSymbolDef> ResolveBuiltinSymbol(
 
 BuiltinDefinitionGenerator::BuiltinDefinitionGenerator(
     llvm::DataLayout data_layout)
-    : data_layout_(std::move(data_layout)) {}
+    : data_layout_(std::move(data_layout)) {
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+  // Resolve MSan runtime functions (e.g. __msan_warning*) from the current
+  // process via dlsym. This is more future-proof than explicitly intercepting
+  // __msan_* functions; these functions do change between LLVM versions.
+  auto is_msan_symbol = [](const llvm::orc::SymbolStringPtr& name) {
+    return (*name).starts_with("__msan_");
+  };
+  // Register runtime symbols as weak -- see ResolveBuiltinSymbol above.
+  auto add_weak_symbols = [](llvm::orc::JITDylib& jd,
+                             llvm::orc::SymbolMap symbols) -> llvm::Error {
+    for (auto& [name, def] : symbols) {
+      def.setFlags(llvm::JITSymbolFlags::Weak);
+    }
+    return jd.define(llvm::orc::absoluteSymbols(std::move(symbols)));
+  };
+  auto generator =
+      llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+          data_layout_.getGlobalPrefix(), is_msan_symbol, add_weak_symbols);
+  if (generator) {
+    process_generator_ = std::move(*generator);
+  } else {
+    LOG(WARNING) << "Failed to initialize dynamic library generator for MSan: "
+                 << llvm::toString(generator.takeError());
+  }
+#endif
+}
 
 llvm::Error BuiltinDefinitionGenerator::tryToGenerate(
-    llvm::orc::LookupState&, llvm::orc::LookupKind kind,
-    llvm::orc::JITDylib& jit_dylib, llvm::orc::JITDylibLookupFlags,
+    llvm::orc::LookupState& ls, llvm::orc::LookupKind kind,
+    llvm::orc::JITDylib& jit_dylib, llvm::orc::JITDylibLookupFlags flags,
     const llvm::orc::SymbolLookupSet& names) {
   llvm::orc::SymbolMap symbols;
   symbols.reserve(names.size());
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+  llvm::orc::SymbolLookupSet msan_names;
+#endif
 
-  for (const auto& [name, flags] : names) {
+  for (const auto& [name, name_flags] : names) {
     if (auto symbol = ResolveBuiltinSymbol(data_layout_, *name)) {
       symbols[name] = *symbol;
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+    } else if ((*name).starts_with("__msan_")) {
+      msan_names.add(name, name_flags);
+#endif
     }
   }
 
   cantFail(jit_dylib.define(llvm::orc::absoluteSymbols(std::move(symbols))));
+
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+  if (!msan_names.empty() && process_generator_) {
+    return process_generator_->tryToGenerate(ls, kind, jit_dylib, flags,
+                                             msan_names);
+  }
+#endif
+
   return llvm::Error::success();
 }
 
