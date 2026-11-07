@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -738,6 +739,21 @@ class HloCostAnalysis : public ConstDfsHloVisitor {
 
   HloCostAnalysis(const HloCostAnalysis&) = delete;
   HloCostAnalysis& operator=(const HloCostAnalysis&) = delete;
+
+ private:
+  struct ComputationVisitTracker {
+    const HloComputation* computation = nullptr;
+    int64_t visited_instruction_count = 0;
+    Properties properties_sum;
+    bool valid = true;
+  };
+
+  absl::flat_hash_map<const HloComputation*, Properties>
+      subcomputation_properties_;
+  absl::flat_hash_set<const HloComputation*> visited_computations_;
+  const HloModule* current_module_ = nullptr;
+  ComputationVisitTracker active_computation_tracker_;
+  bool is_revisiting_instruction_ = false;
 };
 
 }  // namespace xla
