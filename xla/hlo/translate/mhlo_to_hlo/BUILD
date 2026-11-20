@@ -112,6 +112,7 @@ cc_library(
     srcs = ["layout_util.cc"],
     hdrs = ["layout_util.h"],
     deps = [
+        "//xla:shape_tree",
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/builder:xla_builder",

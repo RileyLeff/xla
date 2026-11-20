@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/translate/register.h"
 #include "xla/mlir/utils/error_util.h"
 #include "xla/service/hlo.pb.h"
@@ -184,6 +185,51 @@ TEST(ConvertMlirHloToHloModuleTest, PacksSpmdParametersShardingsForTupleArgs) {
   ASSERT_EQ((*hlo_module)->spmd_parameters_shardings().size(), 1);
   EXPECT_EQ((*hlo_module)->spmd_parameters_shardings()[0].ToString(),
             "{{devices=[1,2]<=[2]}, {replicated}, {devices=[2,1]<=[2]}}");
+}
+
+TEST(ConvertMlirHloToHloModuleTest, FlattensEntryTupleShardingsForTupleArgs) {
+  const std::string kMlirModule = R"mlir(
+    module {
+      func.func @main(
+          %arg0: tensor<2x4xf32> {mhlo.sharding = "{devices=[1,2]<=[2]}"},
+          %arg1: tuple<tensor<f32>, tensor<2x4xf32>> {mhlo.sharding = "{{replicated}, {devices=[2,1]<=[2]}}"},
+          %arg2: tuple<tensor<f32>, tensor<f32>>) -> tensor<2x4xf32> {
+        return %arg0 : tensor<2x4xf32>
+      }
+    }
+  )mlir";
+
+  mlir::DialectRegistry registry;
+  xla::RegisterMlirToHloDependentDialects(registry);
+  mlir::MLIRContext context(registry);
+
+  mlir::BaseScopedDiagnosticHandler handler(&context);
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kMlirModule, &context);
+  ASSERT_THAT(handler.ConsumeStatus(), ::absl_testing::IsOk());
+  ASSERT_TRUE(module);
+
+  MlirToHloConversionOptions options;
+  options.use_tuple_args = true;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> hlo_module,
+                       ConvertMlirHloToHloModule(*module, options));
+
+  const xla::HloComputation* entry = hlo_module->entry_computation();
+  ASSERT_NE(entry, nullptr);
+  ASSERT_EQ(entry->num_parameters(), 1);
+  const xla::HloInstruction* param = entry->parameter_instruction(0);
+  ASSERT_TRUE(param->has_sharding());
+  EXPECT_TRUE(param->sharding().IsTuple());
+  EXPECT_EQ(param->sharding().ToString(),
+            "{{devices=[1,2]<=[2]}, {replicated}, {devices=[2,1]<=[2]}, "
+            "{replicated}, {replicated}}");
+  for (const xla::HloSharding& element : param->sharding().tuple_elements()) {
+    EXPECT_FALSE(element.IsTuple());
+  }
+  EXPECT_THAT(param->sharding().Validate(param->shape()),
+              ::absl_testing::IsOk());
+  EXPECT_THAT(xla::HloSharding::FromProto(param->sharding().ToProto()),
+              ::absl_testing::IsOk());
 }
 
 TEST(ConvertMlirHloToHloModuleTest, MemoizesRepeatedNamedShardings) {

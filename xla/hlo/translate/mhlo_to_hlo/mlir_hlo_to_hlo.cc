@@ -6002,11 +6002,23 @@ LogicalResult ConvertToHloModule::SetEntryTupleShardings(
           return block->getParentOp()->emitError() << status.message();
         }
 
-        *sharding.add_tuple_shardings() = *arg_sharding.value();
+        if (!arg_sharding.value()->has_named_sharding() &&
+            arg_sharding.value()->type() == xla::OpSharding::TUPLE) {
+          for (const xla::OpSharding& subsharding :
+               arg_sharding.value()->tuple_shardings()) {
+            *sharding.add_tuple_shardings() = subsharding;
+          }
+        } else {
+          *sharding.add_tuple_shardings() = *arg_sharding.value();
+        }
       } else {
         xla::OpSharding fallback_sharding;
         fallback_sharding.set_type(xla::OpSharding::REPLICATED);
-        *sharding.add_tuple_shardings() = fallback_sharding;
+        int64_t leaf_count =
+            xla::ShapeUtil::GetLeafCount((*arg_shapes)[arg_sharding.index()]);
+        for (int64_t i = 0; i < leaf_count; ++i) {
+          *sharding.add_tuple_shardings() = fallback_sharding;
+        }
       }
     }
 
