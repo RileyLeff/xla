@@ -344,7 +344,9 @@ absl::StatusOr<std::vector<xla::AxisRef>> BuildAxisRefs(
       sub_proto->set_pre_size(sub.getPreSize());
       sub_proto->set_size(sub.getSize());
     }
-    group_axes.push_back(xla::AxisRef::FromProto(proto));
+    ABSL_ASSIGN_OR_RETURN(xla::AxisRef group_axis,
+                          xla::AxisRef::FromProto(proto));
+    group_axes.push_back(group_axis);
   }
   return group_axes;
 }
