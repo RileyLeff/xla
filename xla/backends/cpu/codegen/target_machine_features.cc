@@ -23,17 +23,63 @@ limitations under the License.
 #include "absl/strings/match.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Triple.h"
 #include "xla/backends/cpu/alignment.h"
+#include "xla/codegen/device_spec.h"
 #include "xla/primitive_util.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::cpu {
 
+CpuDeviceSpec CpuDeviceSpecFromTargetMachine(
+    const llvm::TargetMachine* target_machine) {
+  if (target_machine == nullptr) {
+    return {};
+  }
+  const llvm::Triple& triple = target_machine->getTargetTriple();
+  const llvm::MCSubtargetInfo& subtarget = target_machine->getMCSubtargetInfo();
+
+  if (triple.isX86_64() && triple.getEnvironment() != llvm::Triple::GNUX32) {
+    // X86 sets MaxAtomicSizeInBitsSupported to 128 only on 64 bit targets with
+    // +cx16 (lock cmpxchg16b); without +cx16, LLVM emits __atomic_*_16 libcalls
+    // that the XLA:CPU JIT does not provide. With both +cx16 and +avx (and
+    // without soft float), LLVM lowers 16 byte aligned unordered 128 bit atomic
+    // loads and stores directly to single vector moves (vmovdqa).
+    if (!subtarget.checkFeatures("+64bit-mode,+cx16")) {
+      return {};
+    }
+    return CpuDeviceSpec{
+        /*has_atomic_cmpxchg_128=*/true,
+        /*has_atomic_load_store_128=*/
+        subtarget.checkFeatures("+avx,-soft-float"),
+    };
+  }
+
+  if (triple.getArch() == llvm::Triple::aarch64 &&
+      triple.isAArch64(/*PointerWidth=*/64)) {
+    // AArch64 lowers 128 bit cmpxchg natively via casp when +lse is enabled or
+    // via ldxp/stxp when +outline-atomics is disabled. When +outline-atomics is
+    // enabled without +lse, LLVM emits __aarch64_cas16_* calls that the XLA:CPU
+    // JIT does not resolve. With +lse2, 16 byte aligned unordered 128 bit
+    // atomic loads and stores lower directly to single copy atomic ldp/stp.
+    const bool has_lse = subtarget.checkFeatures("+lse");
+    const bool outline_atomics = subtarget.checkFeatures("+outline-atomics");
+    return CpuDeviceSpec{
+        /*has_atomic_cmpxchg_128=*/has_lse || !outline_atomics,
+        /*has_atomic_load_store_128=*/subtarget.checkFeatures("+lse2"),
+    };
+  }
+
+  return {};
+}
+
 TargetMachineFeatures::TargetMachineFeatures(
     llvm::TargetMachine* target_machine)
-    : target_machine_(target_machine) {
+    : target_machine_(target_machine),
+      cpu_device_spec_(CpuDeviceSpecFromTargetMachine(target_machine)) {
   // Calling virtual methods in the constructor is discouraged, so we don't
   // call `get_target_feature_string` here.
   if (target_machine_) {
