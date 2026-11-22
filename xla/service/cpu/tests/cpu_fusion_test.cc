@@ -461,6 +461,398 @@ ENTRY main {
       LiteralSlice(result, {1}), error_spec_);
 }
 
+TEST_F(CpuFusionTest, ScatterFusionZeroUpdates) {
+  constexpr const char* kHlo = R"hlo(
+    HloModule ScatterFusionZeroUpdates
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    scatter_computation {
+      operand = s32[3,2]{1,0} parameter(0)
+      indices = s32[0,1]{1,0} parameter(1)
+      updates = s32[0,1,2]{2,1,0} parameter(2)
+      ROOT scatter = s32[3,2]{1,0} scatter(operand, indices, updates),
+        update_window_dims={1,2},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={0},
+        index_vector_dim=1,
+        to_apply=add_s32
+    }
+
+    ENTRY main {
+      p0 = s32[3,2]{1,0} parameter(0)
+      operand_copy = s32[3,2]{1,0} copy(p0)
+      p1 = s32[0,1]{1,0} parameter(1)
+      p2 = s32[0,1,2]{2,1,0} parameter(2)
+      ROOT wrapped_scatter = s32[3,2]{1,0} fusion(operand_copy, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  Literal operand = LiteralUtil::CreateR2<int32_t>({{1, 2}, {3, 4}, {5, 6}});
+  Literal indices(ShapeUtil::MakeShape(S32, {0, 1}));
+  Literal updates(ShapeUtil::MakeShape(S32, {0, 1, 2}));
+  ASSERT_OK_AND_ASSIGN(
+      const Literal result,
+      Execute(std::move(module), {&operand, &indices, &updates},
+              /*run_hlo_passes=*/false));
+  EXPECT_EQ(result, operand);
+
+  // Also run an unfused variadic zero update scatter through the full CPU HLO
+  // pipeline with algebraic simplification disabled so ScatterSimplifier,
+  // FusionWrapper, CopyInsertion, and CpuScatterFusion all handle it.
+  constexpr const char* kUnfusedVariadicZeroUpdatesHlo = R"hlo(
+    HloModule UnfusedVariadicZeroUpdates
+
+    reducer {
+      lhs0 = s32[] parameter(0)
+      lhs1 = f64[] parameter(1)
+      rhs0 = s32[] parameter(2)
+      rhs1 = f64[] parameter(3)
+      sum0 = s32[] add(lhs0, rhs0)
+      sum1 = f64[] add(lhs1, rhs1)
+      ROOT out = (s32[], f64[]) tuple(sum0, sum1)
+    }
+
+    ENTRY main {
+      op0 = s32[3,2]{1,0} parameter(0)
+      op1 = f64[3,2]{1,0} parameter(1)
+      idx = s32[0]{0} parameter(2)
+      upd0 = s32[0,2]{1,0} parameter(3)
+      upd1 = f64[0,2]{1,0} parameter(4)
+      ROOT scatter = (s32[3,2]{1,0}, f64[3,2]{1,0}) scatter(
+          op0, op1, idx, upd0, upd1),
+        update_window_dims={1},
+        inserted_window_dims={0},
+        scatter_dims_to_operand_dims={0},
+        index_vector_dim=1,
+        to_apply=reducer
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> variadic_module,
+      ParseAndReturnVerifiedModule(kUnfusedVariadicZeroUpdatesHlo));
+  variadic_module->mutable_config()
+      .mutable_debug_options()
+      .add_xla_disable_hlo_passes("algsimp");
+  Literal op1 =
+      LiteralUtil::CreateR2<double>({{1.5, 2.5}, {3.5, 4.5}, {5.5, 6.5}});
+  Literal idx_1d = LiteralUtil::CreateR1<int32_t>({});
+  Literal upd0(ShapeUtil::MakeShape(S32, {0, 2}));
+  Literal upd1(ShapeUtil::MakeShape(F64, {0, 2}));
+  ASSERT_OK_AND_ASSIGN(const Literal variadic_result,
+                       Execute(std::move(variadic_module),
+                               {&operand, &op1, &idx_1d, &upd0, &upd1}));
+  EXPECT_EQ(LiteralSlice(variadic_result, {0}), operand);
+  EXPECT_EQ(LiteralSlice(variadic_result, {1}), op1);
+}
+
+TEST_F(CpuFusionTest, ScatterFusionZeroSizedUpdateSlice) {
+  constexpr const char* kNonEmptyOperandHlo = R"hlo(
+    HloModule ScatterFusionZeroSliceNonEmptyOperand
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    scatter_computation {
+      operand = s32[3,4]{1,0} parameter(0)
+      indices = s32[2,2]{1,0} parameter(1)
+      updates = s32[2,1,0]{2,1,0} parameter(2)
+      ROOT scatter = s32[3,4]{1,0} scatter(operand, indices, updates),
+        update_window_dims={1,2},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={0,1},
+        index_vector_dim=1,
+        to_apply=add_s32
+    }
+
+    ENTRY main {
+      p0 = s32[3,4]{1,0} parameter(0)
+      operand_copy = s32[3,4]{1,0} copy(p0)
+      p1 = s32[2,2]{1,0} parameter(1)
+      p2 = s32[2,1,0]{2,1,0} parameter(2)
+      ROOT wrapped_scatter = s32[3,4]{1,0} fusion(operand_copy, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kNonEmptyOperandHlo));
+  Literal operand = LiteralUtil::CreateR2<int32_t>(
+      {{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+  Literal indices = LiteralUtil::CreateR2<int32_t>({{1, 2}, {9, 9}});
+  Literal updates(ShapeUtil::MakeShape(S32, {2, 1, 0}));
+  ASSERT_OK_AND_ASSIGN(
+      const Literal result,
+      Execute(std::move(module), {&operand, &indices, &updates},
+              /*run_hlo_passes=*/false));
+  EXPECT_EQ(result, operand);
+
+  constexpr const char* kZeroSizedOperandHlo = R"hlo(
+    HloModule ScatterFusionZeroSliceZeroOperand
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    scatter_computation {
+      operand = s32[3,0]{1,0} parameter(0)
+      indices = s32[2,1]{1,0} parameter(1)
+      updates = s32[2,1,0]{2,1,0} parameter(2)
+      ROOT scatter = s32[3,0]{1,0} scatter(operand, indices, updates),
+        update_window_dims={1,2},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={0},
+        index_vector_dim=1,
+        to_apply=add_s32
+    }
+
+    ENTRY main {
+      p0 = s32[3,0]{1,0} parameter(0)
+      operand_copy = s32[3,0]{1,0} copy(p0)
+      p1 = s32[2,1]{1,0} parameter(1)
+      p2 = s32[2,1,0]{2,1,0} parameter(2)
+      ROOT wrapped_scatter = s32[3,0]{1,0} fusion(operand_copy, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> empty_operand_module,
+                       ParseAndReturnVerifiedModule(kZeroSizedOperandHlo));
+  Literal empty_operand(ShapeUtil::MakeShape(S32, {3, 0}));
+  Literal empty_op_indices = LiteralUtil::CreateR2<int32_t>({{0}, {2}});
+  Literal empty_op_updates(ShapeUtil::MakeShape(S32, {2, 1, 0}));
+  ASSERT_OK_AND_ASSIGN(
+      const Literal empty_result,
+      Execute(std::move(empty_operand_module),
+              {&empty_operand, &empty_op_indices, &empty_op_updates},
+              /*run_hlo_passes=*/false));
+  EXPECT_EQ(empty_result, empty_operand);
+
+  // Full CPU HLO pipeline with algebraic simplification disabled on a zero
+  // sized update slice into a populated operand.
+  constexpr const char* kUnfusedZeroSliceHlo = R"hlo(
+    HloModule UnfusedZeroSliceScatter
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    ENTRY main {
+      operand = s32[3,4]{1,0} parameter(0)
+      indices = s32[2,2]{1,0} parameter(1)
+      updates = s32[2,0]{1,0} parameter(2)
+      ROOT scatter = s32[3,4]{1,0} scatter(operand, indices, updates),
+        update_window_dims={1},
+        inserted_window_dims={0},
+        scatter_dims_to_operand_dims={0,1},
+        index_vector_dim=1,
+        to_apply=add_s32
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> unfused_module,
+                       ParseAndReturnVerifiedModule(kUnfusedZeroSliceHlo));
+  unfused_module->mutable_config()
+      .mutable_debug_options()
+      .add_xla_disable_hlo_passes("algsimp");
+  Literal updates_2d(ShapeUtil::MakeShape(S32, {2, 0}));
+  ASSERT_OK_AND_ASSIGN(
+      const Literal unfused_result,
+      Execute(std::move(unfused_module), {&operand, &indices, &updates_2d}));
+  EXPECT_EQ(unfused_result, operand);
+}
+
+TEST_F(CpuFusionTest, ScatterFusionRankZeroScalarOperands) {
+  // Wrapped fusion with multiple updates into a rank 0 scalar operand.
+  constexpr const char* kFusedMultiUpdateHlo = R"hlo(
+    HloModule ScatterFusionRankZeroMultiUpdate
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    scatter_computation {
+      operand = s32[] parameter(0)
+      indices = s32[3,0]{1,0} parameter(1)
+      updates = s32[3]{0} parameter(2)
+      ROOT scatter = s32[] scatter(operand, indices, updates),
+        update_window_dims={},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={},
+        index_vector_dim=1,
+        to_apply=add_s32
+    }
+
+    ENTRY main {
+      p0 = s32[] parameter(0)
+      operand_copy = s32[] copy(p0)
+      p1 = s32[3,0]{1,0} parameter(1)
+      p2 = s32[3]{0} parameter(2)
+      ROOT wrapped_scatter = s32[] fusion(operand_copy, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  Literal operand = LiteralUtil::CreateR0<int32_t>(10);
+  Literal indices(ShapeUtil::MakeShape(S32, {3, 0}));
+  Literal updates = LiteralUtil::CreateR1<int32_t>({2, 5, -3});
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> fused_module,
+                       ParseAndReturnVerifiedModule(kFusedMultiUpdateHlo));
+  ASSERT_OK_AND_ASSIGN(
+      const Literal fused_result,
+      Execute(std::move(fused_module), {&operand, &indices, &updates},
+              /*run_hlo_passes=*/false));
+  EXPECT_EQ(fused_result, LiteralUtil::CreateR0<int32_t>(14));
+
+  // Unfused variadic rank 0 scatter going through the full CPU HLO pipeline
+  // (ScatterSimplifier + FusionWrapper + CpuScatterFusion).
+  constexpr const char* kUnfusedVariadicRankZeroHlo = R"hlo(
+    HloModule UnfusedVariadicRankZeroScatter
+
+    reducer {
+      lhs0 = s32[] parameter(0)
+      lhs1 = f64[] parameter(1)
+      rhs0 = s32[] parameter(2)
+      rhs1 = f64[] parameter(3)
+      sum0 = s32[] add(lhs0, rhs0)
+      sum1 = f64[] add(lhs1, rhs1)
+      ROOT out = (s32[], f64[]) tuple(sum0, sum1)
+    }
+
+    ENTRY main {
+      op0 = s32[] parameter(0)
+      op1 = f64[] parameter(1)
+      idx = s32[2,2,0]{2,1,0} parameter(2)
+      upd0 = s32[2,2]{1,0} parameter(3)
+      upd1 = f64[2,2]{1,0} parameter(4)
+      ROOT scatter = (s32[], f64[]) scatter(op0, op1, idx, upd0, upd1),
+        update_window_dims={},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={},
+        index_vector_dim=2,
+        to_apply=reducer
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> variadic_module,
+      ParseAndReturnVerifiedModule(kUnfusedVariadicRankZeroHlo));
+  Literal op0 = LiteralUtil::CreateR0<int32_t>(100);
+  Literal op1 = LiteralUtil::CreateR0<double>(1.5);
+  Literal idx_2x2(ShapeUtil::MakeShape(S32, {2, 2, 0}));
+  Literal upd0 = LiteralUtil::CreateR2<int32_t>({{1, 2}, {3, 4}});
+  Literal upd1 = LiteralUtil::CreateR2<double>({{0.5, 1.0}, {2.0, 3.0}});
+  ASSERT_OK_AND_ASSIGN(const Literal variadic_result,
+                       Execute(std::move(variadic_module),
+                               {&op0, &op1, &idx_2x2, &upd0, &upd1}));
+  EXPECT_EQ(LiteralSlice(variadic_result, {0}),
+            LiteralUtil::CreateR0<int32_t>(110));
+  LiteralTestUtil::ExpectR0Near<double>(8.0, LiteralSlice(variadic_result, {1}),
+                                        error_spec_);
+
+  // Wrapped fusion with zero updates into a rank 0 scalar operand.
+  constexpr const char* kZeroUpdatesScalarHlo = R"hlo(
+    HloModule ScatterFusionRankZeroZeroUpdates
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    scatter_computation {
+      operand = s32[] parameter(0)
+      indices = s32[0,0]{1,0} parameter(1)
+      updates = s32[0]{0} parameter(2)
+      ROOT scatter = s32[] scatter(operand, indices, updates),
+        update_window_dims={},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={},
+        index_vector_dim=1,
+        to_apply=add_s32
+    }
+
+    ENTRY main {
+      p0 = s32[] parameter(0)
+      operand_copy = s32[] copy(p0)
+      p1 = s32[0,0]{1,0} parameter(1)
+      p2 = s32[0]{0} parameter(2)
+      ROOT wrapped_scatter = s32[] fusion(operand_copy, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> zero_upd_scalar_module,
+                       ParseAndReturnVerifiedModule(kZeroUpdatesScalarHlo));
+  Literal empty_scalar_idx(ShapeUtil::MakeShape(S32, {0, 0}));
+  Literal empty_scalar_upd = LiteralUtil::CreateR1<int32_t>({});
+  ASSERT_OK_AND_ASSIGN(const Literal zero_upd_scalar_result,
+                       Execute(std::move(zero_upd_scalar_module),
+                               {&operand, &empty_scalar_idx, &empty_scalar_upd},
+                               /*run_hlo_passes=*/false));
+  EXPECT_EQ(zero_upd_scalar_result, operand);
+
+  // Wrapped fusion with a rank 0 scalar update (no ScatterSimplifier).
+  constexpr const char* kScalarSingleUpdateHlo = R"hlo(
+    HloModule ScatterFusionRankZeroScalarUpdate
+
+    add_s32 {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+
+    scatter_computation {
+      operand = s32[] parameter(0)
+      indices = s32[0]{0} parameter(1)
+      updates = s32[] parameter(2)
+      ROOT scatter = s32[] scatter(operand, indices, updates),
+        update_window_dims={},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={},
+        index_vector_dim=0,
+        to_apply=add_s32
+    }
+
+    ENTRY main {
+      p0 = s32[] parameter(0)
+      operand_copy = s32[] copy(p0)
+      p1 = s32[0]{0} parameter(1)
+      p2 = s32[] parameter(2)
+      ROOT wrapped_scatter = s32[] fusion(operand_copy, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> scalar_upd_module,
+                       ParseAndReturnVerifiedModule(kScalarSingleUpdateHlo));
+  Literal empty_1d_idx = LiteralUtil::CreateR1<int32_t>({});
+  Literal scalar_upd = LiteralUtil::CreateR0<int32_t>(7);
+  ASSERT_OK_AND_ASSIGN(const Literal scalar_upd_result,
+                       Execute(std::move(scalar_upd_module),
+                               {&operand, &empty_1d_idx, &scalar_upd},
+                               /*run_hlo_passes=*/false));
+  EXPECT_EQ(scalar_upd_result, LiteralUtil::CreateR0<int32_t>(17));
+}
+
 }  // namespace
 }  // namespace cpu
 }  // namespace xla

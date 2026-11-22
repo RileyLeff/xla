@@ -16,35 +16,73 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
+#include "absl/types/span.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CodeGen.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/Value.h"
+#include "mlir/IR/ValueRange.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/DebugStringHelper.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "xla/backends/cpu/alignment.h"
 #include "xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.h"
+#include "xla/backends/cpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/cpu/codegen/fusion_compiler.h"
 #include "xla/backends/cpu/codegen/fusion_emitter.h"
+#include "xla/backends/cpu/codegen/ir_compiler.h"
+#include "xla/backends/cpu/codegen/jit_compiler.h"
+#include "xla/backends/cpu/runtime/function_library.h"
+#include "xla/backends/cpu/runtime/kernel_c_api.h"
+#include "xla/backends/cpu/target_machine_options.h"
+#include "xla/codegen/emitters/elemental_hlo_to_mlir.h"
+#include "xla/codegen/emitters/ir/xla_attrs.h.inc"
+#include "xla/codegen/emitters/ir/xla_ops.h"
+#include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/kernel_definition.h"
 #include "xla/codegen/llvm_kernel_source.h"
 #include "xla/codegen/mlir_kernel_source.h"
+#include "xla/debug_options_flags.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
+#include "xla/hlo/analysis/indexing_map.h"
+#include "xla/hlo/analysis/interval.h"
+#include "xla/hlo/analysis/symbolic_expr.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -52,17 +90,261 @@ limitations under the License.
 #include "xla/hlo/testlib/filecheck.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/runtime/work_dimensions.h"
+#include "xla/runtime/work_group.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/buffer_value.h"
 #include "xla/service/cpu/cpu_executable.h"
+#include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/service/logical_buffer.h"
+#include "xla/tsl/framework/mlir/status_scoped_diagnostic_handler.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/util.h"
 
 namespace xla {
 namespace cpu {
 namespace {
 
+using ::testing::ElementsAre;
 using ::testing::ElementsAreArray;
+using ::testing::IsEmpty;
+
+struct AlignedBufferDeleter {
+  void operator()(void* ptr) const { std::free(ptr); }
+};
+
+template <typename T>
+absl::StatusOr<std::unique_ptr<T[], AlignedBufferDeleter>>
+AllocateAlignedBuffer(size_t num_elements, T initial_value = T{}) {
+  size_t alignment = std::max<size_t>(MinAlign(), alignof(T));
+  size_t byte_size = std::max<size_t>(alignment, num_elements * sizeof(T));
+  byte_size = RoundUpTo<size_t>(byte_size, alignment);
+  void* raw = std::aligned_alloc(alignment, byte_size);
+  if (raw == nullptr) {
+    return absl::ResourceExhaustedError("aligned_alloc failed");
+  }
+  T* typed = static_cast<T*>(raw);
+  for (size_t i = 0; i < num_elements; ++i) {
+    typed[i] = initial_value;
+  }
+  return std::unique_ptr<T[], AlignedBufferDeleter>(typed);
+}
+
+bool ScatterConstraintsSatisfied(const IndexingMap& map, int64_t thread_id,
+                                 int64_t index_id, int64_t vector_id,
+                                 int64_t vector_element_id) {
+  mlir::MLIRContext* ctx = map.GetMLIRContext();
+  return map.ConstraintsSatisfied(
+      {CreateSymbolicConstant(thread_id, ctx)},
+      {CreateSymbolicConstant(index_id, ctx),
+       CreateSymbolicConstant(vector_id, ctx),
+       CreateSymbolicConstant(vector_element_id, ctx)});
+}
+
+llvm::SmallVector<int64_t, 4> EvaluateScatterMap(const IndexingMap& map,
+                                                 int64_t thread_id,
+                                                 int64_t index_id,
+                                                 int64_t vector_id,
+                                                 int64_t vector_element_id) {
+  mlir::MLIRContext* ctx = map.GetMLIRContext();
+  return map.Evaluate({CreateSymbolicConstant(thread_id, ctx)},
+                      {CreateSymbolicConstant(index_id, ctx),
+                       CreateSymbolicConstant(vector_id, ctx),
+                       CreateSymbolicConstant(vector_element_id, ctx)});
+}
+
+// Builds a module whose entry function iterates over `map` and increments each
+// visited element of a padded count tensor. The padding keeps out of bounds
+// accesses (such as `updates_id == num_updates`) inside the buffer so tests can
+// observe them directly without undefined behavior.
+mlir::OwningOpRef<mlir::ModuleOp> BuildScatterLoopModule(
+    const IndexingMap& map, absl::Span<const int64_t> padded_shape,
+    int64_t num_threads, mlir::MLIRContext* ctx) {
+  mlir::OpBuilder builder(ctx);
+  mlir::Location loc = builder.getUnknownLoc();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      llvm_ir::CreateMlirModuleOp(loc, "scatter_loop_module");
+
+  mlir::DataLayoutEntryInterface index_layout = mlir::DataLayoutEntryAttr::get(
+      builder.getIndexType(), builder.getI32IntegerAttr(64));
+  module->getOperation()->setAttr(
+      mlir::DLTIDialect::kDataLayoutAttrName,
+      mlir::DataLayoutSpecAttr::get(ctx, {index_layout}));
+  module->getOperation()->setAttr(xla::CpuMemoryRegionNameAttr::name,
+                                  builder.getStringAttr("scatter_loop_test"));
+
+  mlir::RankedTensorType tensor_type =
+      mlir::RankedTensorType::get(padded_shape, builder.getI32Type());
+  builder.setInsertionPointToStart(module->getBody());
+  auto func = mlir::func::FuncOp::create(
+      builder, loc, "visit_scatter",
+      builder.getFunctionType({tensor_type}, {tensor_type}));
+  func->setAttr("xla.entry", builder.getUnitAttr());
+  SetBackendKind(ctx, func, BackendKind::kCpu);
+
+  int64_t byte_size =
+      Product(padded_shape) * static_cast<int64_t>(sizeof(int32_t));
+  func.setArgAttrs(
+      0, {builder.getNamedAttr("xla.slice_index", builder.getIndexAttr(0)),
+          builder.getNamedAttr("xla.aliased", builder.getUnitAttr()),
+          builder.getNamedAttr(mlir::LLVM::LLVMDialect::getAlignAttrName(),
+                               builder.getIndexAttr(MinAlign())),
+          builder.getNamedAttr(
+              mlir::LLVM::LLVMDialect::getDereferenceableAttrName(),
+              builder.getIndexAttr(byte_size))});
+
+  mlir::ImplicitLocOpBuilder b(loc, func);
+  b.setInsertionPointToStart(func.addEntryBlock());
+  WorkGroupIdOp workgroup_id = WorkGroupIdOp::create(b, WorkGroupDimension::x);
+  workgroup_id->setAttr("xla.range", b.getIndexArrayAttr({0, num_threads - 1}));
+
+  mlir::ValueRange results = emitters::EmitXlaLoopOp(
+      b, {workgroup_id}, {func.getArgument(0)}, map,
+      [&](mlir::ImplicitLocOpBuilder& nested_b, mlir::ValueRange ivs,
+          mlir::ValueRange map_results,
+          mlir::ValueRange iter_args) -> llvm::SmallVector<mlir::Value> {
+        mlir::Value cur = mlir::tensor::ExtractOp::create(
+            nested_b, iter_args[0], map_results);
+        mlir::Value one =
+            mlir::arith::ConstantIntOp::create(nested_b, 1, /*width=*/32);
+        mlir::Value next = mlir::arith::AddIOp::create(nested_b, cur, one);
+        mlir::Value updated = mlir::tensor::InsertOp::create(
+            nested_b, next, iter_args[0], map_results);
+        return {updated};
+      });
+  mlir::func::ReturnOp::create(b, results);
+  return module;
+}
+
+struct LoweredScatterLoopIr {
+  std::string after_peel;
+  std::string after_scf;
+};
+
+absl::StatusOr<LoweredScatterLoopIr> RunPeelAndLowerScatterLoop(
+    const IndexingMap& map, absl::Span<const int64_t> updates_shape,
+    int64_t num_threads, mlir::MLIRContext* ctx) {
+  std::vector<int64_t> padded_shape;
+  padded_shape.reserve(updates_shape.size());
+  for (int64_t dim : updates_shape) {
+    padded_shape.push_back(dim + 4);
+  }
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      BuildScatterLoopModule(map, padded_shape, num_threads, ctx);
+
+  LoweredScatterLoopIr out;
+  {
+    mlir::PassManager peel_pm(ctx);
+    peel_pm.enableVerifier(true);
+    peel_pm.addNestedPass<mlir::func::FuncOp>(
+        cpu::createPeelWorkgroupLoopPass());
+    tsl::StatusScopedDiagnosticHandler diag(ctx);
+    ABSL_RETURN_IF_ERROR(diag.consumeStatus(peel_pm.run(*module)));
+  }
+  out.after_peel = mlir::debugString(*module);
+
+  {
+    mlir::PassManager scf_pm(ctx);
+    scf_pm.enableVerifier(true);
+    scf_pm.addNestedPass<mlir::func::FuncOp>(
+        emitters::createLowerXlaLoopsToScfPass());
+    tsl::StatusScopedDiagnosticHandler diag(ctx);
+    ABSL_RETURN_IF_ERROR(diag.consumeStatus(scf_pm.run(*module)));
+  }
+  out.after_scf = mlir::debugString(*module);
+  return out;
+}
+
+absl::StatusOr<std::unique_ptr<FunctionLibrary>> JitCompileKernel(
+    LlvmKernelSource llvm_source, absl::string_view kernel_name) {
+  std::unique_ptr<IrCompiler> ir_compiler =
+      IrCompiler::Create({},
+                         IrCompiler::Options{
+                             /*opt_level=*/llvm::CodeGenOptLevel::Default,
+                             /*optimize_for_size=*/false,
+                             TargetMachineOptions(GetDebugOptionsFromFlags()),
+                         },
+                         IrCompiler::CompilationHooks());
+  ABSL_ASSIGN_OR_RETURN(JitCompiler jit,
+                        JitCompiler::Create({}, std::move(ir_compiler)));
+  ABSL_RETURN_IF_ERROR(
+      jit.AddModule(std::move(llvm_source).thread_safe_module()));
+  return std::move(jit).Compile(
+      {FunctionLibrary::Sym<FunctionLibrary::Kernel>(kernel_name)});
+}
+
+ABSL_ATTRIBUTE_NO_SANITIZE_CFI XLA_CPU_KernelError* InvokeKernel(
+    FunctionLibrary::Kernel* kernel, XLA_CPU_KernelCallFrame* frame) {
+  return (*kernel)(frame);
+}
+
+// Compiles a `GetScatterIndexingMap` loop through the full CPU FusionCompiler
+// pipeline (including PeelWorkgroupLoopPass and LowerXlaLoopsToScfPass), runs
+// all `num_threads` workgroups against a padded buffer, and checks that every
+// in bounds update index is visited once and no out of bounds index (including
+// `updates_id == num_updates`) is touched.
+absl::Status VerifyScatterLoopExecution(absl::Span<const int64_t> updates_shape,
+                                        int64_t num_threads,
+                                        int64_t vector_size) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+  IndexingMap map =
+      GetScatterIndexingMap(updates_shape, num_threads, vector_size, ctx.get());
+  map.Simplify();
+
+  constexpr int64_t kGuardPadding = 4;
+  std::vector<int64_t> padded_shape;
+  padded_shape.reserve(updates_shape.size());
+  for (int64_t dim : updates_shape) {
+    padded_shape.push_back(dim + num_threads + vector_size + kGuardPadding);
+  }
+  int64_t total_padded = Product(padded_shape);
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      BuildScatterLoopModule(map, padded_shape, num_threads, ctx.get());
+  FusionCompiler compiler(ctx.get(), FusionCompiler::Options{512, 1, true});
+  ABSL_ASSIGN_OR_RETURN(LlvmKernelSource llvm_source,
+                        compiler.Compile(MlirKernelSource(std::move(module))));
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<FunctionLibrary> library,
+      JitCompileKernel(std::move(llvm_source), "visit_scatter"));
+  ABSL_ASSIGN_OR_RETURN(
+      FunctionLibrary::Kernel * kernel,
+      library->ResolveFunction<FunctionLibrary::Kernel>("visit_scatter"));
+
+  ABSL_ASSIGN_OR_RETURN(auto counts,
+                        AllocateAlignedBuffer<int32_t>(total_padded, 0));
+  XLA_CPU_KernelArg arg = {counts.get(),
+                           static_cast<size_t>(total_padded) * sizeof(int32_t)};
+  XLA_CPU_NumWorkGroups num_workgroups = {static_cast<uint64_t>(num_threads), 1,
+                                          1};
+  for (int64_t wg = 0; wg < num_threads; ++wg) {
+    XLA_CPU_WorkGroupId workgroup_id = {static_cast<uint64_t>(wg), 0, 0};
+    XLA_CPU_KernelCallFrame frame = {&num_workgroups, &workgroup_id, 1, &arg};
+    if (InvokeKernel(kernel, &frame) != nullptr) {
+      return absl::InternalError("visit_scatter returned a kernel error");
+    }
+  }
+
+  bool is_empty_domain = Product(updates_shape) == 0;
+  for (int64_t linear = 0; linear < total_padded; ++linear) {
+    int64_t rem = linear;
+    bool in_bounds = !is_empty_domain;
+    for (int64_t d = static_cast<int64_t>(padded_shape.size()) - 1; d >= 0;
+         --d) {
+      int64_t coord = rem % padded_shape[d];
+      rem /= padded_shape[d];
+      if (coord >= updates_shape[d]) {
+        in_bounds = false;
+      }
+    }
+    int32_t expected = in_bounds ? 1 : 0;
+    if (counts[linear] != expected) {
+      return absl::InternalError(absl::StrCat("count mismatch at linear index ",
+                                              linear, ": got ", counts[linear],
+                                              ", expected ", expected));
+    }
+  }
+  return absl::OkStatus();
+}
 
 struct GetWorkDimensionsTestCase {
   std::string test_name;
@@ -243,6 +525,584 @@ TEST_F(CpuFusionEmitterTest,
   EXPECT_TRUE(wrapped->getArg(2)->hasNoAliasAttr());
   EXPECT_FALSE(wrapped->getArg(2)->use_empty());
   EXPECT_TRUE(wrapped->getArg(3)->use_empty());
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterIndexingMapNonDivisibleNumUpdates) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+
+  // num_updates = 5, num_threads = 3 => num_updates_per_thread = 2.
+  // Workgroup 2 has index_id 0 -> updates_id 4 (last valid update) and
+  // index_id 1 -> updates_id 5 (must be rejected).
+  IndexingMap map = GetScatterIndexingMap(
+      /*updates_operand_shape=*/{5, 4}, /*num_threads=*/3, /*vector_size=*/4,
+      ctx.get());
+  EXPECT_FALSE(map.IsKnownEmpty());
+  EXPECT_EQ(map.GetDimensionBound(0), (Interval{0, 2}));
+  EXPECT_THAT(map.GetSymbolBounds(),
+              ElementsAre(Interval{0, 1}, Interval{0, 0}, Interval{0, 3}));
+  EXPECT_TRUE(ScatterConstraintsSatisfied(map, /*thread_id=*/0, /*index_id=*/0,
+                                          /*vector_id=*/0,
+                                          /*vector_element_id=*/0));
+  EXPECT_TRUE(ScatterConstraintsSatisfied(map, /*thread_id=*/1, /*index_id=*/1,
+                                          /*vector_id=*/0,
+                                          /*vector_element_id=*/3));
+  EXPECT_EQ(EvaluateScatterMap(map, 2, 0, 0, 3),
+            (llvm::SmallVector<int64_t, 4>{4, 3}));
+  EXPECT_TRUE(ScatterConstraintsSatisfied(map, /*thread_id=*/2, /*index_id=*/0,
+                                          /*vector_id=*/0,
+                                          /*vector_element_id=*/3));
+  EXPECT_EQ(EvaluateScatterMap(map, 2, 1, 0, 0),
+            (llvm::SmallVector<int64_t, 4>{5, 0}));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(map, /*thread_id=*/2, /*index_id=*/1,
+                                           /*vector_id=*/0,
+                                           /*vector_element_id=*/0));
+
+  map.Simplify();
+  EXPECT_FALSE(map.IsKnownEmpty());
+  EXPECT_EQ(map.GetDimensionBound(0), (Interval{0, 2}));
+  EXPECT_THAT(map.GetSymbolBounds(),
+              ElementsAre(Interval{0, 1}, Interval{0, 0}, Interval{0, 3}));
+  ASSERT_EQ(map.GetConstraintsCount(), 1);
+  EXPECT_EQ(map.GetSymbolicConstraints().front().second, (Interval{0, 4}));
+  EXPECT_THAT(map.ComputeResultRanges(),
+              ElementsAre(Interval{0, 4}, Interval{0, 3}));
+  EXPECT_TRUE(ScatterConstraintsSatisfied(map, 2, 0, 0, 0));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(map, 2, 1, 0, 0));
+
+  // PeelWorkgroupLoopPass peels workgroups 0..1 without constraints and
+  // narrows workgroup 2's index_id domain to [0, 0] (updates_id == 4 only).
+  ASSERT_OK_AND_ASSIGN(
+      LoweredScatterLoopIr ir,
+      RunPeelAndLowerScatterLoop(map, {5, 4}, /*num_threads=*/3, ctx.get()));
+  EXPECT_THAT(RunFileCheck(ir.after_peel, R"(
+    CHECK: scf.if
+    CHECK:   xla.loop {{.*}} in #xla.indexing_map<"(thread_id)[index_id, vector_id, vector_element_id] -> (thread_id * 2 + index_id, vector_element_id), domain: thread_id in [0, 1], index_id in [0, 1], vector_id in [0, 0], vector_element_id in [0, 3]">
+    CHECK: else
+    CHECK:   xla.loop {{.*}} in #xla.indexing_map<"(thread_id)[index_id, vector_id, vector_element_id] -> (4, vector_element_id), domain: thread_id in [2, 2], index_id in [0, 0], vector_id in [0, 0], vector_element_id in [0, 3]">
+  )"),
+              absl_testing::IsOkAndHolds(true));
+  EXPECT_THAT(RunFileCheck(ir.after_scf, R"(
+    CHECK-NOT: xla.loop
+    CHECK-DAG: %[[C1:.+]] = arith.constant 1 : index
+    CHECK-DAG: %[[C2:.+]] = arith.constant 2 : index
+    CHECK:     scf.if
+    CHECK:       scf.for %{{.+}} = %{{.+}} to %[[C2]]
+    CHECK:     else
+    CHECK:       scf.for %{{.+}} = %{{.+}} to %[[C1]]
+  )"),
+              absl_testing::IsOkAndHolds(true));
+
+  // Two threads with 5 updates (3 updates per thread): workgroup 1 checks
+  // `updates_id <= 4` directly in SCF without peeling, rejecting 5.
+  IndexingMap two_thread_map = GetScatterIndexingMap(
+      {5, 4}, /*num_threads=*/2, /*vector_size=*/4, ctx.get());
+  EXPECT_TRUE(ScatterConstraintsSatisfied(two_thread_map, 1, 1, 0, 0));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(two_thread_map, 1, 2, 0, 0));
+  two_thread_map.Simplify();
+  ASSERT_EQ(two_thread_map.GetConstraintsCount(), 1);
+  EXPECT_EQ(two_thread_map.GetSymbolicConstraints().front().second,
+            (Interval{0, 4}));
+  ASSERT_OK_AND_ASSIGN(
+      LoweredScatterLoopIr two_thread_ir,
+      RunPeelAndLowerScatterLoop(two_thread_map, {5, 4}, /*num_threads=*/2,
+                                 ctx.get()));
+  EXPECT_THAT(RunFileCheck(two_thread_ir.after_scf, R"(
+    CHECK-NOT: xla.loop
+    CHECK-DAG: %[[C4:.+]] = arith.constant 4 : index
+    CHECK:     scf.for
+    CHECK:       arith.cmpi sle, %{{.+}}, %[[C4]]
+  )"),
+              absl_testing::IsOkAndHolds(true));
+
+  EXPECT_OK(VerifyScatterLoopExecution({5, 4}, /*num_threads=*/2,
+                                       /*vector_size=*/4));
+  EXPECT_OK(VerifyScatterLoopExecution({5, 4}, /*num_threads=*/3,
+                                       /*vector_size=*/4));
+  // Includes both a partial workgroup (2) and a fully idle workgroup (3).
+  EXPECT_OK(VerifyScatterLoopExecution({5, 4}, /*num_threads=*/4,
+                                       /*vector_size=*/4));
+  // Even updates with an idle trailing workgroup (3), where updates_id == 6
+  // is the first index of workgroup 3.
+  EXPECT_OK(VerifyScatterLoopExecution({6, 4}, /*num_threads=*/4,
+                                       /*vector_size=*/4));
+  // Multi update partial tail: workgroup 2 handles updates 8 and 9, skips 10
+  // and 11.
+  EXPECT_OK(VerifyScatterLoopExecution({10, 4}, /*num_threads=*/3,
+                                       /*vector_size=*/4));
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterIndexingMapMoreThreadsThanUpdates) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+
+  IndexingMap map = GetScatterIndexingMap(
+      /*updates_operand_shape=*/{3, 4}, /*num_threads=*/8, /*vector_size=*/4,
+      ctx.get());
+  EXPECT_FALSE(map.IsKnownEmpty());
+  EXPECT_EQ(map.GetDimensionBound(0), (Interval{0, 7}));
+  EXPECT_THAT(map.GetSymbolBounds(),
+              ElementsAre(Interval{0, 0}, Interval{0, 0}, Interval{0, 3}));
+  for (int64_t tid = 0; tid < 3; ++tid) {
+    EXPECT_EQ(EvaluateScatterMap(map, tid, 0, 0, 0),
+              (llvm::SmallVector<int64_t, 4>{tid, 0}));
+    EXPECT_TRUE(ScatterConstraintsSatisfied(map, tid, 0, 0, 0));
+  }
+  // updates_id == num_updates (tid == 3) and all higher threads are rejected.
+  for (int64_t tid = 3; tid < 8; ++tid) {
+    EXPECT_FALSE(ScatterConstraintsSatisfied(map, tid, 0, 0, 0));
+  }
+
+  map.Simplify();
+  EXPECT_FALSE(map.IsKnownEmpty());
+  EXPECT_EQ(map.GetDimensionBound(0), (Interval{0, 2}));
+  EXPECT_THAT(map.GetSymbolBounds(),
+              ElementsAre(Interval{0, 0}, Interval{0, 0}, Interval{0, 3}));
+  EXPECT_THAT(map.GetSymbolicConstraints(), IsEmpty());
+  EXPECT_THAT(map.ComputeResultRanges(),
+              ElementsAre(Interval{0, 2}, Interval{0, 3}));
+
+  ASSERT_OK_AND_ASSIGN(
+      LoweredScatterLoopIr ir,
+      RunPeelAndLowerScatterLoop(map, {3, 4}, /*num_threads=*/8, ctx.get()));
+  EXPECT_THAT(RunFileCheck(ir.after_scf, R"(
+    CHECK-NOT: xla.loop
+    CHECK-DAG: %[[C2:.+]] = arith.constant 2 : index
+    CHECK-DAG: %[[WG:.+]] = xla.workgroup_id x
+    CHECK:     scf.for
+    CHECK:       arith.cmpi sle, %[[WG]], %[[C2]]
+  )"),
+              absl_testing::IsOkAndHolds(true));
+
+  EXPECT_OK(VerifyScatterLoopExecution({3, 4}, /*num_threads=*/8,
+                                       /*vector_size=*/4));
+  EXPECT_OK(VerifyScatterLoopExecution({1, 4}, /*num_threads=*/4,
+                                       /*vector_size=*/4));
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterIndexingMapNonDivisibleVectorSize) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+
+  // num_slice_elements = 3 * 2 = 6, vector_size = 4 => 2 vectors per slice;
+  // (vector_id=1, vector_element_id=1) -> linear 5 is valid, linear 6 and 7
+  // are rejected.
+  IndexingMap map = GetScatterIndexingMap(
+      /*updates_operand_shape=*/{5, 3, 2}, /*num_threads=*/3,
+      /*vector_size=*/4, ctx.get());
+  EXPECT_FALSE(map.IsKnownEmpty());
+  EXPECT_THAT(map.GetSymbolBounds(),
+              ElementsAre(Interval{0, 1}, Interval{0, 1}, Interval{0, 3}));
+  EXPECT_EQ(EvaluateScatterMap(map, 2, 0, 1, 1),
+            (llvm::SmallVector<int64_t, 4>{4, 2, 1}));
+  EXPECT_TRUE(ScatterConstraintsSatisfied(map, 2, 0, 1, 1));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(map, 0, 0, 1, 2));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(map, 0, 0, 1, 3));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(map, 2, 1, 0, 0));
+
+  map.Simplify();
+  EXPECT_FALSE(map.IsKnownEmpty());
+  ASSERT_EQ(map.GetConstraintsCount(), 2);
+  std::vector<Interval> constraint_intervals;
+  for (const auto& [expr, interval] : map.GetSymbolicConstraints()) {
+    constraint_intervals.push_back(interval);
+  }
+  EXPECT_THAT(constraint_intervals,
+              ::testing::UnorderedElementsAre(Interval{0, 4}, Interval{0, 5}));
+  EXPECT_EQ(map.ComputeResultRanges()[0], (Interval{0, 4}));
+
+  // PeelWorkgroupLoopPass must not strip the slice tail constraint.
+  ASSERT_OK_AND_ASSIGN(
+      LoweredScatterLoopIr ir,
+      RunPeelAndLowerScatterLoop(map, {5, 3, 2}, /*num_threads=*/3, ctx.get()));
+  EXPECT_THAT(RunFileCheck(ir.after_peel, R"(
+    CHECK-NOT: scf.if
+    CHECK:     xla.loop
+  )"),
+              absl_testing::IsOkAndHolds(true));
+  EXPECT_THAT(RunFileCheck(ir.after_scf, R"(
+    CHECK-NOT: xla.loop
+    CHECK-DAG: arith.constant 4 : index
+    CHECK-DAG: arith.constant 5 : index
+    CHECK:     scf.if
+  )"),
+              absl_testing::IsOkAndHolds(true));
+
+  // When vector_size > num_slice_elements, Simplify folds the slice constraint
+  // into vector_element_id's domain, enabling workgroup peeling on updates_id.
+  IndexingMap small_slice_map = GetScatterIndexingMap(
+      {5, 3}, /*num_threads=*/3, /*vector_size=*/4, ctx.get());
+  EXPECT_TRUE(ScatterConstraintsSatisfied(small_slice_map, 2, 0, 0, 2));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(small_slice_map, 0, 0, 0, 3));
+  EXPECT_FALSE(ScatterConstraintsSatisfied(small_slice_map, 2, 1, 0, 0));
+  small_slice_map.Simplify();
+  EXPECT_THAT(small_slice_map.GetSymbolBounds(),
+              ElementsAre(Interval{0, 1}, Interval{0, 0}, Interval{0, 2}));
+  ASSERT_EQ(small_slice_map.GetConstraintsCount(), 1);
+  EXPECT_EQ(small_slice_map.GetSymbolicConstraints().front().second,
+            (Interval{0, 4}));
+  ASSERT_OK_AND_ASSIGN(
+      LoweredScatterLoopIr small_slice_ir,
+      RunPeelAndLowerScatterLoop(small_slice_map, {5, 3}, /*num_threads=*/3,
+                                 ctx.get()));
+  EXPECT_THAT(RunFileCheck(small_slice_ir.after_peel, R"(
+    CHECK: scf.if
+    CHECK:   xla.loop
+    CHECK: else
+    CHECK:   xla.loop
+  )"),
+              absl_testing::IsOkAndHolds(true));
+
+  EXPECT_OK(VerifyScatterLoopExecution({5, 3, 2}, /*num_threads=*/3,
+                                       /*vector_size=*/4));
+  EXPECT_OK(VerifyScatterLoopExecution({5, 3}, /*num_threads=*/3,
+                                       /*vector_size=*/4));
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterIndexingMapZeroUpdatesAndZeroSlices) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+
+  struct EmptyCase {
+    std::vector<int64_t> updates_shape;
+    int64_t num_threads;
+    int64_t vector_size;
+  };
+  const std::vector<EmptyCase> cases = {
+      {{0, 4, 8}, 1, 4},  // num_updates == 0, single thread
+      {{0, 4, 8}, 4, 4},  // num_updates == 0, multi thread
+      {{0}, 2, 1},        // num_updates == 0, rank 0 operand
+      {{5, 0, 8}, 1, 1},  // num_slice_elements == 0, single thread
+      {{5, 4, 0}, 3, 4},  // num_slice_elements == 0, multi thread, vector > 1
+      {{0, 0}, 2, 1},     // both num_updates == 0 and num_slice_elements == 0
+  };
+
+  for (const EmptyCase& tc : cases) {
+    IndexingMap map = GetScatterIndexingMap(tc.updates_shape, tc.num_threads,
+                                            tc.vector_size, ctx.get());
+    EXPECT_TRUE(map.IsKnownEmpty());
+    EXPECT_EQ(map.GetNumResults(),
+              static_cast<int64_t>(tc.updates_shape.size()));
+    EXPECT_FALSE(ScatterConstraintsSatisfied(map, 0, 0, 0, 0));
+
+    map.Simplify();
+    EXPECT_TRUE(map.IsKnownEmpty());
+    EXPECT_EQ(map.GetDimensionBound(0), (Interval{0, -1}));
+    EXPECT_THAT(map.GetSymbolBounds(),
+                ElementsAre(Interval{0, -1}, Interval{0, -1}, Interval{0, -1}));
+    EXPECT_THAT(map.GetSymbolicConstraints(), IsEmpty());
+
+    ASSERT_OK_AND_ASSIGN(LoweredScatterLoopIr ir,
+                         RunPeelAndLowerScatterLoop(map, tc.updates_shape,
+                                                    tc.num_threads, ctx.get()));
+    EXPECT_THAT(RunFileCheck(ir.after_scf, R"(
+      CHECK-NOT: xla.loop
+      CHECK:     %[[C0:.+]] = arith.constant 0 : index
+      CHECK:     scf.for %{{.+}} = %[[C0]] to %[[C0]]
+    )"),
+                absl_testing::IsOkAndHolds(true));
+    EXPECT_OK(VerifyScatterLoopExecution(tc.updates_shape, tc.num_threads,
+                                         tc.vector_size));
+  }
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterIndexingMapRankZeroScalarOperand) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+
+  // Rank 0 scatter operand has updates shape [num_updates], so slice_shape is
+  // empty and num_slice_elements == 1. Test both vector_size == 1 and
+  // vector_size > 1 (where vector_element_id >= 1 must be rejected so each
+  // scalar update is applied once).
+  for (int64_t vector_size : {int64_t{1}, int64_t{4}}) {
+    IndexingMap map = GetScatterIndexingMap(
+        /*updates_operand_shape=*/{5}, /*num_threads=*/3, vector_size,
+        ctx.get());
+    EXPECT_FALSE(map.IsKnownEmpty());
+    EXPECT_EQ(map.GetNumResults(), 1);
+    EXPECT_EQ(EvaluateScatterMap(map, 2, 0, 0, 0),
+              (llvm::SmallVector<int64_t, 4>{4}));
+    EXPECT_TRUE(ScatterConstraintsSatisfied(map, 2, 0, 0, 0));
+    EXPECT_FALSE(ScatterConstraintsSatisfied(map, 2, 1, 0, 0));
+    if (vector_size > 1) {
+      EXPECT_FALSE(ScatterConstraintsSatisfied(map, 0, 0, 0, 1));
+    }
+
+    map.Simplify();
+    EXPECT_FALSE(map.IsKnownEmpty());
+    EXPECT_EQ(map.GetDimensionBound(0), (Interval{0, 2}));
+    EXPECT_THAT(map.GetSymbolBounds(),
+                ElementsAre(Interval{0, 1}, Interval{0, 0}, Interval{0, 0}));
+    ASSERT_EQ(map.GetConstraintsCount(), 1);
+    EXPECT_EQ(map.GetSymbolicConstraints().front().second, (Interval{0, 4}));
+    EXPECT_THAT(map.ComputeResultRanges(), ElementsAre(Interval{0, 4}));
+
+    ASSERT_OK_AND_ASSIGN(
+        LoweredScatterLoopIr ir,
+        RunPeelAndLowerScatterLoop(map, {5}, /*num_threads=*/3, ctx.get()));
+    EXPECT_THAT(RunFileCheck(ir.after_peel, R"(
+      CHECK: scf.if
+      CHECK:   xla.loop {{.*}} in #xla.indexing_map<"(thread_id)[index_id, vector_id, vector_element_id] -> (thread_id * 2 + index_id), domain: thread_id in [0, 1], index_id in [0, 1], vector_id in [0, 0], vector_element_id in [0, 0]">
+      CHECK: else
+      CHECK:   xla.loop {{.*}} in #xla.indexing_map<"(thread_id)[index_id, vector_id, vector_element_id] -> (4), domain: thread_id in [2, 2], index_id in [0, 0], vector_id in [0, 0], vector_element_id in [0, 0]">
+    )"),
+                absl_testing::IsOkAndHolds(true));
+    EXPECT_THAT(RunFileCheck(ir.after_scf, "CHECK-NOT: xla.loop"),
+                absl_testing::IsOkAndHolds(true));
+    EXPECT_OK(VerifyScatterLoopExecution({5}, /*num_threads=*/3, vector_size));
+  }
+
+  EXPECT_OK(
+      VerifyScatterLoopExecution({3}, /*num_threads=*/6, /*vector_size=*/1));
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterIndexingMapRejectsInvalidInputs) {
+  std::unique_ptr<mlir::MLIRContext> ctx = FusionCompiler::CreateContext();
+  EXPECT_DEATH(GetScatterIndexingMap({}, /*num_threads=*/1, /*vector_size=*/1,
+                                     ctx.get()),
+               "updates_operand_shape");
+  EXPECT_DEATH(GetScatterIndexingMap({4, 4}, /*num_threads=*/0,
+                                     /*vector_size=*/1, ctx.get()),
+               "num_threads");
+  EXPECT_DEATH(GetScatterIndexingMap({4, 4}, /*num_threads=*/1,
+                                     /*vector_size=*/0, ctx.get()),
+               "vector_size");
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterEmptyShapesShortCircuitAndExecute) {
+  constexpr absl::string_view kZeroUpdatesHlo = R"hlo(
+    HloModule scatter_zero_updates
+    add {
+      lhs = f32[] parameter(0)
+      rhs = f32[] parameter(1)
+      ROOT sum = f32[] add(lhs, rhs)
+    }
+    scatter_computation {
+      operand = f32[2,2]{1,0} parameter(0)
+      indices = s32[0,1]{1,0} parameter(1)
+      updates = f32[0,1,2]{2,1,0} parameter(2)
+      ROOT s = f32[2,2]{1,0} scatter(operand, indices, updates),
+        update_window_dims={1,2},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={0},
+        index_vector_dim=1,
+        to_apply=add
+    }
+    ENTRY main {
+      p0 = f32[2,2]{1,0} parameter(0)
+      p1 = s32[0,1]{1,0} parameter(1)
+      p2 = f32[0,1,2]{2,1,0} parameter(2)
+      ROOT wrapped_scatter = f32[2,2]{1,0} fusion(p0, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  constexpr absl::string_view kZeroSliceHlo = R"hlo(
+    HloModule scatter_zero_slice
+    add {
+      lhs = f32[] parameter(0)
+      rhs = f32[] parameter(1)
+      ROOT sum = f32[] add(lhs, rhs)
+    }
+    scatter_computation {
+      operand = f32[2,2]{1,0} parameter(0)
+      indices = s32[2,2]{1,0} parameter(1)
+      updates = f32[2,1,0]{2,1,0} parameter(2)
+      ROOT s = f32[2,2]{1,0} scatter(operand, indices, updates),
+        update_window_dims={1,2},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={0,1},
+        index_vector_dim=1,
+        to_apply=add
+    }
+    ENTRY main {
+      p0 = f32[2,2]{1,0} parameter(0)
+      p1 = s32[2,2]{1,0} parameter(1)
+      p2 = f32[2,1,0]{2,1,0} parameter(2)
+      ROOT wrapped_scatter = f32[2,2]{1,0} fusion(p0, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  for (absl::string_view hlo : {kZeroUpdatesHlo, kZeroSliceHlo}) {
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                         ParseAndReturnVerifiedModule(hlo));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BufferAssignment> buffer_assignment,
+                         RunBufferAssignment(*module));
+    const auto* fusion = Cast<HloFusionInstruction>(
+        module->entry_computation()->root_instruction());
+    std::unique_ptr<mlir::MLIRContext> mlir_context =
+        FusionCompiler::CreateContext();
+    CpuScatterFusion emitter(*buffer_assignment, fusion, mlir_context.get());
+    ASSERT_OK_AND_ASSIGN(KernelDefinition<MlirKernelSource> kernel_definition,
+                         emitter.EmitKernelDefinition());
+    EXPECT_THAT(RunFileCheck(kernel_definition.source().ToString(), R"(
+      CHECK:     func.func @wrapped_scatter(
+      CHECK-NOT: xla.loop
+      CHECK:     return
+    )"),
+                absl_testing::IsOkAndHolds(true));
+
+    FusionCompiler compiler(mlir_context.get(),
+                            FusionCompiler::Options{512, 1, true});
+    ASSERT_OK_AND_ASSIGN(
+        LlvmKernelSource llvm_source,
+        compiler.Compile(std::move(kernel_definition).TakeSource()));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<FunctionLibrary> library,
+        JitCompileKernel(std::move(llvm_source), "wrapped_scatter"));
+    ASSERT_OK_AND_ASSIGN(
+        FunctionLibrary::Kernel * kernel,
+        library->ResolveFunction<FunctionLibrary::Kernel>("wrapped_scatter"));
+
+    ASSERT_OK_AND_ASSIGN(auto operand_buf, AllocateAlignedBuffer<float>(4));
+    for (int i = 0; i < 4; ++i) {
+      operand_buf[i] = static_cast<float>(i + 10);
+    }
+    ASSERT_OK_AND_ASSIGN(auto indices_buf,
+                         AllocateAlignedBuffer<int32_t>(4, 99));
+    std::vector<XLA_CPU_KernelArg> args = {
+        {operand_buf.get(), 4 * sizeof(float)},
+        {indices_buf.get(), 4 * sizeof(int32_t)},
+        {nullptr, 0},
+        {operand_buf.get(), 4 * sizeof(float)},
+    };
+    XLA_CPU_NumWorkGroups num_workgroups = {1, 1, 1};
+    XLA_CPU_WorkGroupId workgroup_id = {0, 0, 0};
+    XLA_CPU_KernelCallFrame frame = {&num_workgroups, &workgroup_id,
+                                     args.size(), args.data()};
+    EXPECT_EQ(InvokeKernel(kernel, &frame), nullptr);
+    EXPECT_THAT(absl::MakeConstSpan(operand_buf.get(), 4),
+                ElementsAre(10.0f, 11.0f, 12.0f, 13.0f));
+  }
+}
+
+TEST_F(CpuFusionEmitterTest, ScatterRankZeroOperandCompilesAndExecutes) {
+  constexpr absl::string_view kMultiUpdateScalarHlo = R"hlo(
+    HloModule scatter_rank0_multi
+    add {
+      lhs = s32[] parameter(0)
+      rhs = s32[] parameter(1)
+      ROOT sum = s32[] add(lhs, rhs)
+    }
+    scatter_computation {
+      operand = s32[] parameter(0)
+      indices = s32[3,0]{1,0} parameter(1)
+      updates = s32[3]{0} parameter(2)
+      ROOT s = s32[] scatter(operand, indices, updates),
+        update_window_dims={},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={},
+        index_vector_dim=1,
+        to_apply=add
+    }
+    ENTRY main {
+      p0 = s32[] parameter(0)
+      p1 = s32[3,0]{1,0} parameter(1)
+      p2 = s32[3]{0} parameter(2)
+      ROOT wrapped_scatter = s32[] fusion(p0, p1, p2),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kMultiUpdateScalarHlo));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<BufferAssignment> buffer_assignment,
+                       RunBufferAssignment(*module));
+  const auto* fusion = Cast<HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  std::unique_ptr<mlir::MLIRContext> mlir_context =
+      FusionCompiler::CreateContext();
+  ASSERT_OK_AND_ASSIGN(
+      KernelDefinition<MlirKernelSource> kernel_definition,
+      EmitFusionKernel(*mlir_context, *fusion, buffer_assignment.get(),
+                       /*use_unique_c_name=*/false,
+                       /*enable_tiled_emitter=*/false));
+  FusionCompiler compiler(mlir_context.get(),
+                          FusionCompiler::Options{512, 1, true});
+  ASSERT_OK_AND_ASSIGN(
+      LlvmKernelSource llvm_source,
+      compiler.Compile(std::move(kernel_definition).TakeSource()));
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<FunctionLibrary> library,
+      JitCompileKernel(std::move(llvm_source), "wrapped_scatter"));
+  ASSERT_OK_AND_ASSIGN(
+      FunctionLibrary::Kernel * kernel,
+      library->ResolveFunction<FunctionLibrary::Kernel>("wrapped_scatter"));
+
+  ASSERT_OK_AND_ASSIGN(auto operand_buf, AllocateAlignedBuffer<int32_t>(1, 10));
+  ASSERT_OK_AND_ASSIGN(auto updates_buf, AllocateAlignedBuffer<int32_t>(3));
+  updates_buf[0] = 4;
+  updates_buf[1] = -2;
+  updates_buf[2] = 7;
+  std::vector<XLA_CPU_KernelArg> args = {
+      {operand_buf.get(), sizeof(int32_t)},
+      {nullptr, 0},
+      {updates_buf.get(), 3 * sizeof(int32_t)},
+      {operand_buf.get(), sizeof(int32_t)},
+  };
+  XLA_CPU_NumWorkGroups num_workgroups = {1, 1, 1};
+  XLA_CPU_WorkGroupId workgroup_id = {0, 0, 0};
+  XLA_CPU_KernelCallFrame frame = {&num_workgroups, &workgroup_id, args.size(),
+                                   args.data()};
+  EXPECT_EQ(InvokeKernel(kernel, &frame), nullptr);
+  EXPECT_EQ(operand_buf[0], 19);
+}
+
+TEST_F(CpuFusionEmitterTest, VariadicScatterVectorSizeUsesWidestOperandType) {
+  // Operand 0 is s8 (1 byte) and operand 1 is c128 (16 bytes). With a 64 byte
+  // vectorization budget, max_vectorized_elements must be 64 / 16 = 4 (giving
+  // s1 in [0, 3], s2 in [0, 3] for slice size 16), not 16 from s8 alone.
+  constexpr absl::string_view kVariadicHlo = R"hlo(
+    HloModule variadic_scatter_vector_size
+    reducer {
+      lhs0 = s8[] parameter(0)
+      lhs1 = c128[] parameter(1)
+      rhs0 = s8[] parameter(2)
+      rhs1 = c128[] parameter(3)
+      sum0 = s8[] add(lhs0, rhs0)
+      sum1 = c128[] add(lhs1, rhs1)
+      ROOT out = (s8[], c128[]) tuple(sum0, sum1)
+    }
+    scatter_computation {
+      op0 = s8[4,16]{1,0} parameter(0)
+      op1 = c128[4,16]{1,0} parameter(1)
+      indices = s32[2,1]{1,0} parameter(2)
+      upd0 = s8[2,1,16]{2,1,0} parameter(3)
+      upd1 = c128[2,1,16]{2,1,0} parameter(4)
+      ROOT s = (s8[4,16]{1,0}, c128[4,16]{1,0}) scatter(
+          op0, op1, indices, upd0, upd1),
+        update_window_dims={1,2},
+        inserted_window_dims={},
+        scatter_dims_to_operand_dims={0},
+        index_vector_dim=1,
+        to_apply=reducer
+    }
+    ENTRY main {
+      p0 = s8[4,16]{1,0} parameter(0)
+      p1 = c128[4,16]{1,0} parameter(1)
+      p2 = s32[2,1]{1,0} parameter(2)
+      p3 = s8[2,1,16]{2,1,0} parameter(3)
+      p4 = c128[2,1,16]{2,1,0} parameter(4)
+      ROOT wrapped_scatter = (s8[4,16]{1,0}, c128[4,16]{1,0}) fusion(
+          p0, p1, p2, p3, p4),
+        kind=kLoop, calls=scatter_computation
+    }
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kVariadicHlo));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<BufferAssignment> buffer_assignment,
+                       RunBufferAssignment(*module));
+  const auto* fusion = Cast<HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  std::unique_ptr<mlir::MLIRContext> mlir_context =
+      FusionCompiler::CreateContext();
+  CpuScatterFusion emitter(*buffer_assignment, fusion, mlir_context.get());
+  ASSERT_OK_AND_ASSIGN(KernelDefinition<MlirKernelSource> kernel_definition,
+                       emitter.EmitKernelDefinition());
+  EXPECT_THAT(RunFileCheck(kernel_definition.source().ToString(), R"(
+    CHECK: domain: thread_id in [0, 0], index_id in [0, 1], vector_id in [0, 3], vector_element_id in [0, 3]
+  )"),
+              absl_testing::IsOkAndHolds(true));
+  FusionCompiler compiler(mlir_context.get(),
+                          FusionCompiler::Options{512, 1, true});
+  EXPECT_THAT(compiler.Compile(std::move(kernel_definition).TakeSource()),
+              absl_testing::IsOk());
 }
 
 TEST_F(CpuFusionEmitterTest, SortComparatorMlirAndLlvm) {
