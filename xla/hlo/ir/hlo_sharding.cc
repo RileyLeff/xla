@@ -1223,7 +1223,9 @@ const TileAssignment& HloSharding::TileAgnosticDeviceAssignment() const {
 /*static*/ absl::StatusOr<HloSharding> HloSharding::FromProto(
     const OpSharding& proto) {
   if (proto.has_named_sharding()) {
-    return HloSharding(NamedSharding::FromProto(proto.named_sharding()));
+    ABSL_ASSIGN_OR_RETURN(NamedSharding named_sharding,
+                          NamedSharding::FromProto(proto.named_sharding()));
+    return HloSharding(std::move(named_sharding));
   }
 
   const bool has_reduction_op = absl::c_any_of(
@@ -1264,7 +1266,9 @@ const TileAssignment& HloSharding::TileAgnosticDeviceAssignment() const {
 /*static*/ absl::StatusOr<HloSharding> HloSharding::FromProtoInternal(
     const OpSharding& proto) {
   if (proto.has_named_sharding()) {
-    return HloSharding(NamedSharding::FromProto(proto.named_sharding()));
+    ABSL_ASSIGN_OR_RETURN(NamedSharding named_sharding,
+                          NamedSharding::FromProto(proto.named_sharding()));
+    return HloSharding(std::move(named_sharding));
   }
 
   std::vector<OpMetadata> metadata(proto.metadata().begin(),
