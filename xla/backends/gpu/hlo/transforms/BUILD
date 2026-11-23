@@ -3352,10 +3352,12 @@ cc_library(
         "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/libraries/cub:cub_sort_planner",
         "//xla/backends/gpu/libraries/cub:cub_sort_utils",
         "//xla/ffi",
         "//xla/ffi:call_frame",
         "//xla/ffi:execution_state",
+        "//xla/ffi:ffi_api",  # buildcleaner: keep
         "//xla/ffi:ffi_registry",
         "//xla/ffi:invoke",
         "//xla/ffi/api:c_api",
@@ -3363,6 +3365,8 @@ cc_library(
         "//xla/hlo/pass:hlo_pass",
         "//xla/service/gpu:cublas_cudnn",
         "//xla/stream_executor:device_address",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/tsl/platform:logging",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log:check",
@@ -3428,20 +3432,20 @@ cc_library(
     ],
 )
 
-xla_test(
+xla_cc_test(
     name = "estimate_cub_sort_scratch_size_test",
     srcs = ["estimate_cub_sort_scratch_size_test.cc"],
-    backends = ["h100"],
-    tags = ["cuda-only"],
     deps = [
         ":estimate_cub_sort_scratch_size",
         "//xla:xla_data_proto_cc",
-        "//xla/service:platform_util",
-        "//xla/stream_executor:platform",
-        "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
-        "//xla/tests:hlo_pjrt_test_base",
-        "@com_google_absl//absl/strings",
-        "@com_google_googletest//:gtest",
+        "//xla/backends/gpu/libraries/cub:cub_sort_planner",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/hlo/testlib:verified_hlo_module",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -4223,7 +4227,6 @@ xla_cc_test(
     srcs = ["sort_rewriter_deviceless_test.cc"],
     deps = [
         ":sort_rewriter",
-        "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
@@ -4233,6 +4236,7 @@ xla_cc_test(
         "//xla/service/gpu:cublas_cudnn",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",

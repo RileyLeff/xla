@@ -2179,16 +2179,22 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     // annotations, this pass will add the annotations.
     pipeline.AddPass<SubByteNormalization>(
         SubByteNormalization::SET_ELEMENT_SIZE);
-    if (stream_exec == nullptr ||
-        debug_options.xla_gpu_deviceless_cub_mode() ==
-            DebugOptions::DEVICELESS_CUB_FORCE_ON_NO_FALLBACK) {
+    if (gpu_target_config.device_description.gpu_compute_capability()
+            .IsCuda()) {
+      pipeline.AddPass<EstimateCubSortScratchSize>(
+          gpu_target_config.platform_name,
+          gpu_target_config.device_description.gpu_compute_capability());
+    } else if (stream_exec == nullptr ||
+               debug_options.xla_gpu_deviceless_cub_mode() ==
+                   DebugOptions::DEVICELESS_CUB_FORCE_ON_NO_FALLBACK) {
       pipeline.AddPass<DevicelessEstimateCubSortScratchSize>(
           gpu_target_config.platform_name,
           gpu_target_config.device_description.name(),
           gpu_target_config.device_description.cub_version());
     } else {
       pipeline.AddPass<EstimateCubSortScratchSize>(
-          gpu_target_config.platform_name);
+          gpu_target_config.platform_name,
+          gpu_target_config.device_description.gpu_compute_capability());
     }
     pipeline.AddPass<EstimateCubScanScratchSize>(
         gpu_target_config.platform_name);

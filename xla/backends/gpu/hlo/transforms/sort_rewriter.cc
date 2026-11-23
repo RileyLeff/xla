@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -721,6 +722,15 @@ bool IsCubCompatibleSort(const se::DeviceDescription& device_description,
     return false;
   }
 
+  const int64_t segment_size = operand_shape.dimensions().back();
+  const int64_t total_items = Product(operand_shape.dimensions());
+  if (segment_size > 0 && total_items / segment_size > 1 &&
+      segment_size > std::numeric_limits<int32_t>::max()) {
+    VLOG(2) << "Batched sort segment size exceeds int32_t limit: "
+            << segment_size;
+    return false;
+  }
+
   if (!ShouldRewriteCompatibleSort(device_description, sort_op)) {
     VLOG(2) << "Tensor shape and type will not see an improvement.";
     return false;
@@ -750,6 +760,13 @@ absl::StatusOr<bool> ShouldRewriteSort(
     DebugOptions::DevicelessCubMode deviceless_cub_mode) {
   if (!IsCubCompatibleSort(device_description, &sort)) {
     return false;
+  }
+
+  // On CUDA, CUB sort scratch sizing and kernel emission are computed purely
+  // in C++ from the target compute capability without a live device or lookup
+  // tables.
+  if (device_description.gpu_compute_capability().IsCuda()) {
+    return true;
   }
 
   // When compiling CUB sorts we need to determine the scratch size needed. The
@@ -1015,6 +1032,7 @@ absl::StatusOr<bool> SortRewriter::RunImpl(
   auto deviceless_cub_mode =
       module->config().debug_options().xla_gpu_deviceless_cub_mode();
   if (is_deviceless_ && !is_early_exit_with_layouts_ &&
+      !device_description_.gpu_compute_capability().IsCuda() &&
       deviceless_cub_mode == DebugOptions::DEVICELESS_CUB_DISABLED) {
     LOG(WARNING) << "Using fallback sort algorithm rather than SortRewriter, "
                     "which will be slower at runtime. To avoid this, "

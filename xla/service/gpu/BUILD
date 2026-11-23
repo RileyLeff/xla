@@ -490,6 +490,7 @@ cc_library(
         "//xla/backends/gpu/ffi:ffi_attributes_from_backend_config",
         "//xla/backends/gpu/hlo/transforms:dynamic_slice_copy",
         "//xla/backends/gpu/hlo/transforms:dynamic_slice_fusion",
+        "//xla/backends/gpu/libraries/cub:cub_sort_thunk_emitter",
         "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_emitter_context",
         "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_handler_registry",
         "//xla/backends/gpu/runtime:all_gather_thunk",
