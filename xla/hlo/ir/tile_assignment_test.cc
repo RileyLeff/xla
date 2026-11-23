@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
@@ -598,6 +599,42 @@ TEST(IotaTileAssignmentTest, CopyAndMove) {
   EXPECT_TRUE(moved_to_2.dims().empty());
   EXPECT_TRUE(moved_to_2.reshape_dims().empty());
   EXPECT_TRUE(moved_to_2.transpose_perm().empty());
+}
+
+TEST(IotaTileAssignmentTest, TryCreateFromIotaTransform) {
+  auto make_transform = [](absl::Span<const int64_t> reshape_dims,
+                           absl::Span<const int64_t> transpose_perm) {
+    MeshProto::IotaTransform transform;
+    for (int64_t dim : reshape_dims) {
+      transform.add_reshape_dims(dim);
+    }
+    for (int64_t perm : transpose_perm) {
+      transform.add_transpose_perm(perm);
+    }
+    return transform;
+  };
+
+  absl::StatusOr<IotaTileAssignment> iota =
+      IotaTileAssignment::TryCreate({2, 2}, make_transform({2, 2}, {1, 0}));
+  ASSERT_THAT(iota, IsOk());
+  EXPECT_EQ(*iota, IotaTileAssignment::Create({2, 2}, {2, 2}, {1, 0}));
+
+  // The low 32 bits of these entries form valid permutations.
+  const std::vector<std::vector<int64_t>> invalid_perms = {
+      {4294967297, 4294967296},
+      {-4294967296, 1},
+      {std::numeric_limits<int64_t>::max(), 0},
+      {std::numeric_limits<int64_t>::min(), 0}};
+  for (const std::vector<int64_t>& perm : invalid_perms) {
+    EXPECT_THAT(
+        IotaTileAssignment::TryCreate({2, 2}, make_transform({2, 2}, perm)),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("out of range")));
+  }
+  EXPECT_THAT(
+      IotaTileAssignment::TryCreate({2, 2}, make_transform({2, 3}, {1, 0})),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("must match expected")));
 }
 
 }  // namespace
