@@ -192,3 +192,43 @@ cc_embed_data(
     # copybara:uncomment compatible_with = ["//buildenv/target:non_prod"],
     embedopts = ["--namespace=xla::gpu"],
 )
+
+cc_library(
+    name = "cub_sort_policy",
+    hdrs = ["cub_sort_policy.h"],
+    # copybara:uncomment compatible_with = ["//buildenv/target:non_prod"],
+    visibility = ["//xla:internal"],
+)
+
+cc_library(
+    name = "cub_sort_planner",
+    srcs = ["cub_sort_planner.cc"],
+    hdrs = ["cub_sort_planner.h"],
+    # copybara:uncomment compatible_with = ["//buildenv/target:non_prod"],
+    visibility = ["//xla:internal"],
+    deps = [
+        ":cub_sort_policy",
+        "//xla:shape_util",
+        "//xla:util",
+        "//xla:xla_data_proto_cc",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+xla_cc_test(
+    name = "cub_sort_planner_test",
+    srcs = ["cub_sort_planner_test.cc"],
+    deps = [
+        ":cub_sort_planner",
+        ":cub_sort_policy",
+        "//xla:xla_data_proto_cc",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
