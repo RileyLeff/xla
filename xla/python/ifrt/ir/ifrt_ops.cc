@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/python/ifrt/ir/ifrt_ops.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <tuple>
 #include <utility>
@@ -32,6 +33,7 @@ limitations under the License.
 #include "llvm/Support/Casting.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Operation.h"
@@ -348,6 +350,13 @@ mlir::LogicalResult CopyArraysOp::verify() {
   IfrtArrayType first_output = GetArrayType(getOutputs().front());
   IfrtDevicesAttr dst_devices = first_output.getDevicesAttr();
   mlir::StringAttr dst_memory_kind = first_output.getMemoryKindAttr();
+  if (src_devices.getIds().size() != dst_devices.getIds().size()) {
+    return emitOpError()
+           << "requires input and output arrays to have the same number of "
+              "devices, got "
+           << src_devices.getIds().size() << " vs. "
+           << dst_devices.getIds().size();
+  }
   for (const auto [idx, pair] :
        llvm::enumerate(llvm::zip(getInputs(), getOutputs()))) {
     const IfrtArrayType input_array = GetArrayType(std::get<0>(pair));
@@ -578,9 +587,33 @@ mlir::MutableOperandRange CallOp::getArgOperandsMutable() {
 
 mlir::LogicalResult CallOp::verifySymbolUses(
     mlir::SymbolTableCollection& symbolTable) {
+  auto emit_nesting_error = [&]() {
+    return emitOpError()
+           << "requires '" << getCallee()
+           << "' to reference a `func.func` directly in the enclosing "
+              "`builtin.module` or in a named direct child `builtin.module`";
+  };
+  mlir::ModuleOp call_parent_module =
+      (*this)->getParentOfType<mlir::ModuleOp>();
+  const size_t nesting_depth = getCallee().getNestedReferences().size();
+  if (call_parent_module == nullptr || nesting_depth > 1) {
+    return emit_nesting_error();
+  }
   mlir::FailureOr<mlir::func::FuncOp> callee = verifyCalleeSymbol(symbolTable);
   if (mlir::failed(callee)) {
     return mlir::failure();
+  }
+  mlir::Operation* callee_parent = (*callee)->getParentOp();
+  mlir::ModuleOp callee_module =
+      llvm::dyn_cast_or_null<mlir::ModuleOp>(callee_parent);
+  const bool is_flat_callee =
+      nesting_depth == 0 && callee_parent == call_parent_module.getOperation();
+  const bool is_outlined_callee =
+      nesting_depth == 1 && callee_module != nullptr &&
+      callee_module.getSymNameAttr() != nullptr &&
+      callee_module->getParentOp() == call_parent_module.getOperation();
+  if (!is_flat_callee && !is_outlined_callee) {
+    return emit_nesting_error();
   }
   if (callee->isExternal()) {
     return emitOpError()

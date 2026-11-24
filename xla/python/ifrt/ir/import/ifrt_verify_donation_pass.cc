@@ -13,7 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -207,7 +206,6 @@ class DonationTracker {
           out_shards[input_index] = ref.index;
         } else {
           const llvm::ArrayRef<int32_t> shard_ids = GetShardArenaIds(ref);
-          CHECK_EQ(shard_ids.size(), 1);
           out_shards[input_index] = shard_ids.front();
         }
       }
@@ -485,13 +483,9 @@ mlir::LogicalResult VerifyCallOpAliasesAndDonations(IfrtCallOpInterface op,
   const unsigned num_inputs = static_cast<unsigned>(num_inputs_size);
   llvm::SmallBitVector donated_or_aliased_inputs(num_inputs);
   for (const int32_t input_index : op.getDonatedInputIndices()) {
-    CHECK_GE(input_index, 0);
-    CHECK_LT(static_cast<unsigned>(input_index), num_inputs);
     donated_or_aliased_inputs.set(static_cast<unsigned>(input_index));
   }
   for (const IoAlias& io_alias : op.getIoAliasPairs()) {
-    CHECK_GE(io_alias.input_index, 0);
-    CHECK_LT(static_cast<unsigned>(io_alias.input_index), num_inputs);
     donated_or_aliased_inputs.set(static_cast<unsigned>(io_alias.input_index));
   }
 
@@ -582,8 +576,8 @@ mlir::LogicalResult VerifyCopyArraysOp(CopyArraysOp op,
 
   bool any_device_equal = all_devices_equal;
   if (same_memory_kind && !any_device_equal) {
-    const size_t min_shards = std::min(in_devices.size(), out_devices.size());
-    for (size_t shard_index = 0; shard_index < min_shards; ++shard_index) {
+    for (size_t shard_index = 0; shard_index < in_devices.size();
+         ++shard_index) {
       if (in_devices[shard_index] == out_devices[shard_index]) {
         any_device_equal = true;
         break;
@@ -617,8 +611,7 @@ mlir::LogicalResult VerifyCopyArraysOp(CopyArraysOp op,
        llvm::zip_equal(in_views, out_shards_list)) {
     for (size_t shard_index = 0; shard_index < out_shards.size();
          ++shard_index) {
-      if (shard_index < in_devices.size() &&
-          in_devices[shard_index] == out_devices[shard_index]) {
+      if (in_devices[shard_index] == out_devices[shard_index]) {
         int32_t dst_array_id = tracker.GetArrayIdForShard(in_view, shard_index);
         if (donated) {
           auto [it, inserted] =
@@ -661,8 +654,6 @@ mlir::LogicalResult VerifyRemapArraysOp(RemapArraysOp op,
   llvm::DenseMap<int32_t, int32_t> remapped_donated_shard_id;
   for (const IfrtArrayMappingAttr array_mapping :
        op.getMappings().getAsRange<IfrtArrayMappingAttr>()) {
-    CHECK_GE(array_mapping.getInArrayIndex(), 0);
-    CHECK_GE(array_mapping.getOutArrayIndex(), 0);
     const DonationTracker::ArrayView in_view =
         in_views[static_cast<size_t>(array_mapping.getInArrayIndex())];
     llvm::MutableArrayRef<int32_t> out_shards =
@@ -674,12 +665,6 @@ mlir::LogicalResult VerifyRemapArraysOp(RemapArraysOp op,
       int64_t in_shard = in_interval.getStart();
       int64_t out_shard = out_interval.getStart();
       while (in_shard < in_interval.getEnd()) {
-        CHECK_GE(in_shard, 0);
-        CHECK_GE(out_shard, 0);
-        CHECK_LE(static_cast<uint64_t>(in_shard),
-                 static_cast<uint64_t>(std::numeric_limits<size_t>::max()));
-        CHECK_LE(static_cast<uint64_t>(out_shard),
-                 static_cast<uint64_t>(std::numeric_limits<size_t>::max()));
         int32_t dst_array_id =
             tracker.GetArrayIdForShard(in_view, static_cast<size_t>(in_shard));
         if (donated) {
