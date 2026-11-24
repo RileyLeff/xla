@@ -15,6 +15,7 @@
 
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tsl:tsl.default.bzl", "get_compatible_with_portable")
 
 package(
@@ -43,11 +44,34 @@ gentbl_cc_library(
 )
 
 cc_library(
+    name = "nontemporal_hint_targets",
+    srcs = ["nontemporal_hint_targets.cc"],
+    hdrs = ["nontemporal_hint_targets.h"],
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/rocm:rocm_compute_capability",
+    ],
+)
+
+xla_cc_test(
+    name = "nontemporal_hint_targets_test",
+    srcs = ["nontemporal_hint_targets_test.cc"],
+    deps = [
+        ":nontemporal_hint_targets",
+        "//xla/stream_executor:device_description",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "lower_tensors_patterns",
     srcs = ["lower_tensors_patterns.cc"],
     hdrs = ["lower_tensors_patterns.h"],
     compatible_with = get_compatible_with_portable(),
     deps = [
+        ":nontemporal_hint_targets",
         "//xla:util",
         "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
         "//xla/codegen/emitters/ir:xla",
@@ -59,6 +83,7 @@ cc_library(
         "@com_google_absl//absl/log:check",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:GPUDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:LLVMDialect",
