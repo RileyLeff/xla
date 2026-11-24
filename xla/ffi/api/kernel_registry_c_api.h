@@ -54,6 +54,21 @@ extern "C" {
 // XLA and the client.
 typedef struct XLA_FFI_KernelRegistryState XLA_FFI_KernelRegistryState;
 
+// Output for registering a device kernel with the XLA runtime.
+// `kernel` is the opaque executable-owned handle. `already_cached` is non-zero
+// if the kernel was already loaded on the current device before this call, or
+// 0 if this call loaded it.
+typedef struct XLA_FFI_KernelRegistry_Register_Result {
+  size_t struct_size;
+  XLA_FFI_InternalExtension* extension_start;
+
+  const XLA_FFI_Kernel* kernel;
+  int32_t already_cached;
+} XLA_FFI_KernelRegistry_Register_Result;
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_KernelRegistry_Register_Result,
+                             already_cached);
+
 // Arguments for registering a device kernel with the XLA runtime.
 // `kernel_spec` describes the kernel name, binary payload (PTX or CUBIN), size,
 // and format. `uses_pdl` is a flag (0 = off, non-zero = on) that says whether
@@ -65,16 +80,17 @@ struct XLA_FFI_KernelRegistry_Register_Args {
   XLA_FFI_KernelRegistryState* state;
   const XLA_FFI_KernelSpec* kernel_spec;
   int32_t uses_pdl;
-  const XLA_FFI_Kernel* cached_kernel;  // in, optional
-  const XLA_FFI_Kernel* kernel;         // out
+  const XLA_FFI_Kernel* cached_kernel;             // in, optional
+  XLA_FFI_KernelRegistry_Register_Result* result;  // out
 };
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_KernelRegistry_Register_Args, kernel);
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_KernelRegistry_Register_Args, result);
 
-// Registers a device kernel (PTX or CUBIN) for the current device and returns
-// an opaque `XLA_FFI_Kernel*` handle in `args->kernel`. Call on every Prepare
-// or Initialize so each device loads the module; pass `cached_kernel` (from a
-// prior call on the same executable) to skip binary hashing and map lookup.
+// Registers a device kernel (PTX or CUBIN) for the current device and writes
+// the opaque `XLA_FFI_Kernel*` handle and cache status to `args->result`. Call
+// on every Prepare or Initialize so each device loads the module; pass
+// `cached_kernel` (from a prior call on the same executable) to skip binary
+// hashing and map lookup.
 // Valid stages: Prepare, Initialize.
 // Lifetime:
 // - `kernel_spec` (including `name` and `data`) is only read during the call
@@ -139,12 +155,12 @@ typedef XLA_FFI_Error* XLA_FFI_KernelRegistry_Launch(
 //   const XLA_FFI_Kernel* cached =
 //       state->kernel.load(std::memory_order_acquire);
 //   ABSL_ASSIGN_OR_RETURN(
-//       const XLA_FFI_Kernel* kernel,
+//       ffi::RegisterResult result,
 //       registry.Register("my_kernel", kPtxData, kPtxSize,
 //                         ffi::SourceFormat::kPtx, /*uses_pdl=*/false,
 //                         cached));
 //   if (cached == nullptr) {
-//     state->kernel.store(kernel, std::memory_order_release);
+//     state->kernel.store(result.kernel, std::memory_order_release);
 //   }
 //   return absl::OkStatus();
 // }

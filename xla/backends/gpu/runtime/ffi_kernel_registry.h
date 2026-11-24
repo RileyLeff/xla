@@ -62,6 +62,13 @@ absl::StatusOr<stream_executor::Kernel*> FindDeviceKernel(
 // Executable-scoped registry that owns the kernels FFI handlers register.
 class FfiKernelRegistry {
  public:
+  struct RegisterResult {
+    const XLA_FFI_Kernel* kernel = nullptr;
+    // True if the kernel was already loaded on `executor`'s device before this
+    // call; false if this call loaded it.
+    bool already_cached = false;
+  };
+
   explicit FfiKernelRegistry(int num_devices);
   ~FfiKernelRegistry();
 
@@ -71,7 +78,7 @@ class FfiKernelRegistry {
   // Registers (or reuses) a kernel handle and loads it on `executor`'s device.
   // `data` is copied when needed; matching (name, binary, format, `use_pdl`)
   // share one handle.
-  absl::StatusOr<const XLA_FFI_Kernel*> Register(
+  absl::StatusOr<RegisterResult> Register(
       stream_executor::StreamExecutor* absl_nullable executor,
       absl::string_view name, const void* absl_nullable data, size_t size,
       XLA_FFI_SourceFormat format, bool use_pdl);
